@@ -85,41 +85,85 @@ class OpenAIProvider(LLMProvider):
 
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str | None, model: str) -> None:
-        self.api_key = api_key
-        self.model = model
+        self.api_key = (api_key or "").strip()
+        self.model = (model or "gemini-1.5-flash").strip().removeprefix("models/")
 
     async def generate(self, prompt: str) -> str:
         if not self.api_key:
-            raise LLMProviderError("GEMINI_API_KEY is not configured")
+            raise LLMProviderError(
+                "GEMINI_API_KEY is not configured. Please add your Google AI Studio API key "
+                "to backend/.env (e.g. GEMINI_API_KEY=AIzaSy...)"
+            )
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     url,
-                    params={"key": self.api_key},
+                    headers={
+                        "x-goog-api-key": self.api_key,
+                        "Content-Type": "application/json",
+                    },
                     json={"contents": [{"parts": [{"text": prompt}]}]},
                 )
-                response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise LLMProviderError(f"Gemini request failed: {exc}") from exc
+            raise LLMProviderError(f"Gemini connection failed: {exc}") from exc
+
+        if response.status_code != 200:
+            error_message = f"HTTP {response.status_code}"
+            try:
+                error_json = response.json()
+                if isinstance(error_json, dict) and "error" in error_json:
+                    error_message = error_json["error"].get("message") or error_message
+            except Exception:
+                error_message = response.text or error_message
+            raise LLMProviderError(f"Google AI Studio error: {error_message}")
 
         try:
             data: dict[str, Any] = response.json()
-            return str(data["candidates"][0]["content"]["parts"][0]["text"]).strip()
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise LLMProviderError("Gemini returned an unexpected response format") from exc
+        except ValueError as exc:
+            raise LLMProviderError("Gemini returned an invalid JSON response") from exc
+
+        candidates = data.get("candidates")
+        if not candidates:
+            feedback = data.get("promptFeedback", {})
+            block_reason = feedback.get("blockReason")
+            if block_reason:
+                return f"Prompt blocked by Google Gemini safety filters: {block_reason}"
+            raise LLMProviderError("Google AI Studio returned no candidate responses.")
+
+        first_candidate = candidates[0]
+        finish_reason = first_candidate.get("finishReason")
+        if finish_reason == "SAFETY":
+            return "Response blocked by Google Gemini safety filters."
+
+        try:
+            return str(first_candidate["content"]["parts"][0]["text"]).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMProviderError(f"Gemini returned an unexpected response structure: {data}") from exc
 
 
 def get_provider(name: str | None = None) -> LLMProvider:
+    import os
+    from dotenv import dotenv_values
+
     settings = get_settings()
     provider_name = (name or settings.llm_provider).lower()
 
+    # Load fresh values from .env if present to reflect on-the-fly config updates
+    fresh_env = dotenv_values(".env")
+
     if provider_name == "ollama":
-        return OllamaProvider(settings.ollama_base_url, settings.ollama_model)
+        base_url = fresh_env.get("OLLAMA_BASE_URL") or os.getenv("OLLAMA_BASE_URL") or settings.ollama_base_url
+        model = fresh_env.get("OLLAMA_MODEL") or os.getenv("OLLAMA_MODEL") or settings.ollama_model
+        return OllamaProvider(base_url, model)
     if provider_name == "openai":
-        return OpenAIProvider(settings.openai_api_key, settings.openai_model)
+        api_key = fresh_env.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or settings.openai_api_key
+        model = fresh_env.get("OPENAI_MODEL") or os.getenv("OPENAI_MODEL") or settings.openai_model
+        return OpenAIProvider(api_key, model)
     if provider_name == "gemini":
-        return GeminiProvider(settings.gemini_api_key, settings.gemini_model)
+        api_key = fresh_env.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or settings.gemini_api_key
+        model = fresh_env.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or settings.gemini_model
+        return GeminiProvider(api_key, model)
 
     raise LLMProviderError(f"Unsupported LLM provider: {provider_name}")
